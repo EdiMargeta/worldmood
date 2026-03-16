@@ -1,10 +1,4 @@
 {
-  "crons": [
-    {
-      "path": "/api/simulation/run",
-      "schedule": "* * * * *"
-    }
-  ],
   "headers": [
     {
       "source": "/api/:path*",
