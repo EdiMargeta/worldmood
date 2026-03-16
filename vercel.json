@@ -1,0 +1,17 @@
+{
+  "crons": [
+    {
+      "path": "/api/simulation/run",
+      "schedule": "* * * * *"
+    }
+  ],
+  "headers": [
+    {
+      "source": "/api/:path*",
+      "headers": [
+        { "key": "Access-Control-Allow-Origin", "value": "*" },
+        { "key": "Access-Control-Allow-Methods", "value": "GET, POST, OPTIONS" }
+      ]
+    }
+  ]
+}
