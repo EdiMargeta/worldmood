@@ -1,16 +1,15 @@
-// app/api/votes/route.ts
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextRequest, NextResponse } from 'next/server'
 import { createServerClient } from '@/lib/supabase/server'
+import { getSimulationSettings } from '@/lib/simulation'
 import crypto from 'crypto'
 
-// Simple in-memory IP rate limiter (in production use Redis/Upstash)
 const ipVoteCount = new Map<string, { count: number; resetAt: number }>()
 
 function checkRateLimit(ipHash: string): boolean {
   const now = Date.now()
-  const window = 60 * 60 * 1000 // 1 hour
+  const window = 60 * 60 * 1000
   const limit = 50
-
   const entry = ipVoteCount.get(ipHash)
   if (!entry || now > entry.resetAt) {
     ipVoteCount.set(ipHash, { count: 1, resetAt: now + window })
@@ -33,7 +32,6 @@ export async function POST(req: NextRequest) {
 
   const { country_id, vote_type, fingerprint } = body
 
-  // Validate inputs
   if (!country_id || !vote_type || !fingerprint) {
     return NextResponse.json({ error: 'Missing required fields' }, { status: 400 })
   }
@@ -44,18 +42,18 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Invalid fingerprint' }, { status: 400 })
   }
 
-  // IP rate limiting
   const ip = req.headers.get('x-forwarded-for')?.split(',')[0] || 'unknown'
   const ipHash = crypto.createHash('sha256').update(ip).digest('hex').slice(0, 16)
 
   if (!checkRateLimit(ipHash)) {
-    return NextResponse.json(
-      { error: 'Too many votes. Try again later.' },
-      { status: 429 }
-    )
+    return NextResponse.json({ error: 'Too many votes. Try again later.' }, { status: 429 })
   }
 
-  // Verify country exists
+  // Read cooldown_hours from admin settings
+  const settings = await getSimulationSettings()
+  const cooldownHours = settings.cooldown_hours || 24
+  const cutoff = new Date(Date.now() - cooldownHours * 60 * 60 * 1000).toISOString()
+
   const { data: country, error: countryError } = await supabase
     .from('countries')
     .select('id, name, flag_emoji')
@@ -66,24 +64,29 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Country not found' }, { status: 404 })
   }
 
-  // Check cooldown: one vote per fingerprint per country per 24h
-  const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
+  // Check cooldown using the configured hours
   const { data: existingVote } = await supabase
     .from('votes')
-    .select('id')
+    .select('id, created_at')
     .eq('country_id', country_id)
     .eq('voter_fingerprint', fingerprint)
     .gte('created_at', cutoff)
     .maybeSingle()
 
   if (existingVote) {
+    // Calculate when cooldown expires so client can show a timer
+    const votedAt = new Date((existingVote as any).created_at).getTime()
+    const expiresAt = votedAt + cooldownHours * 60 * 60 * 1000
     return NextResponse.json(
-      { error: 'Already voted on this country in the last 24 hours' },
+      {
+        error: 'Already voted on this country',
+        cooldown_hours: cooldownHours,
+        expires_at: new Date(expiresAt).toISOString(),
+      },
       { status: 409 }
     )
   }
 
-  // Insert vote
   const { data: vote, error: insertError } = await supabase
     .from('votes')
     .insert({
@@ -101,23 +104,10 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Failed to record vote' }, { status: 500 })
   }
 
-  // Broadcast to realtime channel for live feed
-  await supabase.channel('votes').send({
-    type: 'broadcast',
-    event: 'new_vote',
-    payload: {
-      country_name: country.name,
-      flag_emoji: country.flag_emoji,
-      vote_type,
-      country_id,
-    },
-  })
-
-  return NextResponse.json({ success: true, vote_id: vote.id })
+  return NextResponse.json({ success: true, vote_id: (vote as any).id })
 }
 
 export async function GET(req: NextRequest) {
-  // Check if user has voted on a country
   const { searchParams } = new URL(req.url)
   const country_id = searchParams.get('country_id')
   const fingerprint = searchParams.get('fingerprint')
@@ -127,18 +117,28 @@ export async function GET(req: NextRequest) {
   }
 
   const supabase = createServerClient()
-  const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
+  const settings = await getSimulationSettings()
+  const cooldownHours = settings.cooldown_hours || 24
+  const cutoff = new Date(Date.now() - cooldownHours * 60 * 60 * 1000).toISOString()
 
   const { data } = await supabase
     .from('votes')
-    .select('vote_type')
+    .select('vote_type, created_at')
     .eq('country_id', country_id)
     .eq('voter_fingerprint', fingerprint)
     .gte('created_at', cutoff)
     .maybeSingle()
 
+  let expires_at = null
+  if (data) {
+    const votedAt = new Date((data as any).created_at).getTime()
+    expires_at = new Date(votedAt + cooldownHours * 60 * 60 * 1000).toISOString()
+  }
+
   return NextResponse.json({
     has_voted: !!data,
-    vote_type: data?.vote_type || null,
+    vote_type: (data as any)?.vote_type || null,
+    expires_at,
+    cooldown_hours: cooldownHours,
   })
 }

@@ -1,19 +1,63 @@
 'use client'
-// components/panels/CountryPanel.tsx
 
 import { useState, useEffect } from 'react'
 import { CountryWithStats } from '@/types'
-import { getFingerprint, isOnCooldown, setLocalVoteCooldown } from '@/lib/fingerprint'
+import { getFingerprint, setLocalVoteCooldown } from '@/lib/fingerprint'
 
 interface CountryPanelProps {
   country: CountryWithStats | null
   onClose: () => void
 }
 
+function CooldownTimer({ expiresAt }: { expiresAt: string }) {
+  const [remaining, setRemaining] = useState('')
+
+  useEffect(() => {
+    const update = () => {
+      const ms = new Date(expiresAt).getTime() - Date.now()
+      if (ms <= 0) { setRemaining(''); return }
+      const h = Math.floor(ms / 3600000)
+      const m = Math.floor((ms % 3600000) / 60000)
+      const s = Math.floor((ms % 60000) / 1000)
+      setRemaining(`${h}h ${m}m ${s}s`)
+    }
+    update()
+    const interval = setInterval(update, 1000)
+    return () => clearInterval(interval)
+  }, [expiresAt])
+
+  if (!remaining) return null
+
+  return (
+    <div style={{
+      background: 'rgba(251,191,36,0.1)',
+      border: '1px solid rgba(251,191,36,0.25)',
+      borderRadius: '12px',
+      padding: '10px 14px',
+      display: 'flex',
+      alignItems: 'center',
+      gap: '8px',
+      marginBottom: '8px',
+    }}>
+      <span style={{ fontSize: '16px' }}>⏳</span>
+      <div>
+        <p style={{ color: 'rgba(251,191,36,0.9)', fontSize: '12px', fontWeight: 600 }}>
+          Cooldown active
+        </p>
+        <p style={{ color: 'rgba(251,191,36,0.6)', fontSize: '11px' }}>
+          Next vote available in {remaining}
+        </p>
+      </div>
+    </div>
+  )
+}
+
 export default function CountryPanel({ country, onClose }: CountryPanelProps) {
   const [voted, setVoted] = useState<'positive' | 'negative' | null>(null)
   const [onCooldown, setOnCooldown] = useState(false)
+  const [expiresAt, setExpiresAt] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
+  const [checkingCooldown, setCheckingCooldown] = useState(false)
   const [localStats, setLocalStats] = useState<CountryWithStats | null>(null)
 
   useEffect(() => {
@@ -21,13 +65,9 @@ export default function CountryPanel({ country, onClose }: CountryPanelProps) {
     setLocalStats(country)
     setVoted(null)
     setOnCooldown(false)
+    setExpiresAt(null)
+    setCheckingCooldown(true)
 
-    // Check cooldown
-    if (isOnCooldown(country.id)) {
-      setOnCooldown(true)
-    }
-
-    // Check server-side cooldown too
     getFingerprint().then(fp => {
       fetch(`/api/votes?country_id=${country.id}&fingerprint=${fp}`)
         .then(r => r.json())
@@ -35,8 +75,11 @@ export default function CountryPanel({ country, onClose }: CountryPanelProps) {
           if (data.has_voted) {
             setVoted(data.vote_type)
             setOnCooldown(true)
+            setExpiresAt(data.expires_at)
           }
+          setCheckingCooldown(false)
         })
+        .catch(() => setCheckingCooldown(false))
     })
   }, [country])
 
@@ -49,19 +92,18 @@ export default function CountryPanel({ country, onClose }: CountryPanelProps) {
       const res = await fetch('/api/votes', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          country_id: country.id,
-          vote_type: voteType,
-          fingerprint: fp,
-        }),
+        body: JSON.stringify({ country_id: country.id, vote_type: voteType, fingerprint: fp }),
       })
+
+      const data = await res.json()
 
       if (res.ok) {
         setVoted(voteType)
         setOnCooldown(true)
         setLocalVoteCooldown(country.id)
-
-        // Optimistically update stats
+        // Set expires_at based on cooldown hours returned
+        const cooldownHours = data.cooldown_hours || 24
+        setExpiresAt(new Date(Date.now() + cooldownHours * 3600000).toISOString())
         setLocalStats(prev => {
           if (!prev) return prev
           return {
@@ -71,9 +113,11 @@ export default function CountryPanel({ country, onClose }: CountryPanelProps) {
             total_votes: prev.total_votes + 1,
           }
         })
-      } else {
-        const data = await res.json()
-        console.error('Vote failed:', data.error)
+      } else if (res.status === 409) {
+        // Already voted — show cooldown
+        setVoted(data.vote_type || null)
+        setOnCooldown(true)
+        setExpiresAt(data.expires_at)
       }
     } finally {
       setLoading(false)
@@ -83,9 +127,8 @@ export default function CountryPanel({ country, onClose }: CountryPanelProps) {
   const handleShare = () => {
     if (!localStats) return
     const positive = localStats.total_votes > 0
-      ? Math.round((localStats.likes_24h / localStats.total_votes) * 100)
-      : 0
-    const text = `Global sentiment toward ${localStats.flag_emoji} ${localStats.name} today: ${positive}% positive — Cast your vote at WorldSentimentMap.com`
+      ? Math.round((localStats.likes_24h / localStats.total_votes) * 100) : 0
+    const text = `Global sentiment toward ${localStats.flag_emoji} ${localStats.name} today: ${positive}% positive — Cast your vote at WorldMood`
     if (navigator.share) {
       navigator.share({ text, url: window.location.href })
     } else {
@@ -96,149 +139,151 @@ export default function CountryPanel({ country, onClose }: CountryPanelProps) {
   if (!country || !localStats) return null
 
   const positivePercent = localStats.total_votes > 0
-    ? Math.round((localStats.likes_24h / localStats.total_votes) * 100)
-    : 0
+    ? Math.round((localStats.likes_24h / localStats.total_votes) * 100) : 0
 
-  const sentimentLabel = localStats.sentiment > 0.2
-    ? 'Positive' : localStats.sentiment > 0.05
-    ? 'Slightly Positive' : localStats.sentiment < -0.2
-    ? 'Negative' : localStats.sentiment < -0.05
-    ? 'Slightly Negative' : 'Neutral'
+  const sentimentLabel = localStats.sentiment > 0.2 ? 'Positive'
+    : localStats.sentiment > 0.05 ? 'Slightly Positive'
+    : localStats.sentiment < -0.2 ? 'Negative'
+    : localStats.sentiment < -0.05 ? 'Slightly Negative'
+    : 'Neutral'
 
-  const sentimentColor = localStats.sentiment > 0.05
-    ? 'text-green-400' : localStats.sentiment < -0.05
-    ? 'text-red-400' : 'text-white/60'
+  const sentimentColor = localStats.sentiment > 0.05 ? '#4ade80'
+    : localStats.sentiment < -0.05 ? '#f87171'
+    : 'rgba(255,255,255,0.5)'
+
+  const panel: React.CSSProperties = {
+    position: 'fixed',
+    zIndex: 50,
+    right: '16px',
+    top: '72px',
+    width: '360px',
+    backgroundColor: '#0d0d1a',
+    border: '1px solid rgba(255,255,255,0.1)',
+    borderRadius: '16px',
+    boxShadow: '0 25px 60px rgba(0,0,0,0.6)',
+    overflow: 'hidden',
+  }
 
   return (
     <>
-      {/* Backdrop */}
       <div
-        className="fixed inset-0 bg-black/30 backdrop-blur-sm z-40 md:hidden"
+        style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.3)', zIndex: 40 }}
         onClick={onClose}
       />
-
-      {/* Panel */}
-      <div className="
-        fixed z-50
-        bottom-0 left-0 right-0
-        md:bottom-auto md:top-4 md:right-4 md:left-auto
-        md:w-[360px]
-        bg-[#0d0d1a] border border-white/10
-        rounded-t-2xl md:rounded-2xl
-        shadow-2xl shadow-black/60
-        overflow-hidden
-        animate-in slide-in-from-bottom md:slide-in-from-right duration-300
-      ">
+      <div style={panel}>
         {/* Header */}
-        <div className="flex items-center justify-between p-5 border-b border-white/10">
-          <div className="flex items-center gap-3">
-            <span className="text-4xl">{localStats.flag_emoji}</span>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '20px', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+            <span style={{ fontSize: '40px' }}>{localStats.flag_emoji}</span>
             <div>
-              <h2 className="text-white font-bold text-xl leading-tight">{localStats.name}</h2>
-              <p className="text-white/40 text-sm">{localStats.region} · {localStats.continent}</p>
+              <h2 style={{ color: 'white', fontWeight: 700, fontSize: '20px', lineHeight: 1.2 }}>{localStats.name}</h2>
+              <p style={{ color: 'rgba(255,255,255,0.4)', fontSize: '13px' }}>{localStats.region} · {localStats.continent}</p>
             </div>
           </div>
-          <button
-            onClick={onClose}
-            className="text-white/40 hover:text-white w-8 h-8 flex items-center justify-center rounded-full hover:bg-white/10 transition-colors"
-          >
-            ✕
-          </button>
+          <button onClick={onClose} style={{ color: 'rgba(255,255,255,0.4)', background: 'none', border: 'none', cursor: 'pointer', fontSize: '18px', width: '32px', height: '32px', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>✕</button>
         </div>
 
-        {/* Stats */}
-        <div className="p-5 space-y-4">
+        <div style={{ padding: '20px', display: 'flex', flexDirection: 'column', gap: '16px' }}>
           {/* Sentiment bar */}
           <div>
-            <div className="flex justify-between text-sm mb-2">
-              <span className="text-white/50">Global Sentiment (24h)</span>
-              <span className={`font-bold ${sentimentColor}`}>{sentimentLabel}</span>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px', fontSize: '13px' }}>
+              <span style={{ color: 'rgba(255,255,255,0.5)' }}>Global Sentiment (24h)</span>
+              <span style={{ fontWeight: 700, color: sentimentColor }}>{sentimentLabel}</span>
             </div>
-            <div className="h-2 bg-white/10 rounded-full overflow-hidden">
-              <div
-                className="h-full rounded-full transition-all duration-700"
-                style={{
-                  width: `${positivePercent}%`,
-                  background: `linear-gradient(to right, ${
-                    positivePercent > 50
-                      ? '#16a34a, #22c55e'
-                      : '#dc2626, #ef4444'
-                  })`,
-                }}
-              />
+            <div style={{ height: '8px', background: 'rgba(255,255,255,0.1)', borderRadius: '4px', overflow: 'hidden' }}>
+              <div style={{
+                height: '100%', borderRadius: '4px',
+                width: `${positivePercent}%`,
+                background: positivePercent >= 50 ? 'linear-gradient(to right, #16a34a, #22c55e)' : 'linear-gradient(to right, #dc2626, #ef4444)',
+                transition: 'width 0.7s ease',
+              }} />
             </div>
-            <div className="flex justify-between text-xs mt-1 text-white/30">
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '4px', fontSize: '11px', color: 'rgba(255,255,255,0.3)' }}>
               <span>👎 {localStats.dislikes_24h.toLocaleString()}</span>
               <span>{positivePercent}% positive</span>
               <span>👍 {localStats.likes_24h.toLocaleString()}</span>
             </div>
           </div>
 
-          {/* Numbers grid */}
-          <div className="grid grid-cols-3 gap-3">
+          {/* Stats grid */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '8px' }}>
             {[
-              { label: 'Total Votes', value: localStats.total_votes.toLocaleString(), color: 'text-white' },
-              { label: '👍 Likes', value: localStats.likes_24h.toLocaleString(), color: 'text-green-400' },
-              { label: '👎 Dislikes', value: localStats.dislikes_24h.toLocaleString(), color: 'text-red-400' },
+              { label: 'Total Votes', value: localStats.total_votes.toLocaleString(), color: 'white' },
+              { label: '👍 Likes', value: localStats.likes_24h.toLocaleString(), color: '#4ade80' },
+              { label: '👎 Dislikes', value: localStats.dislikes_24h.toLocaleString(), color: '#f87171' },
             ].map(({ label, value, color }) => (
-              <div key={label} className="bg-white/5 rounded-xl p-3 text-center">
-                <p className={`text-xl font-bold ${color}`}>{value}</p>
-                <p className="text-white/40 text-xs mt-1">{label}</p>
+              <div key={label} style={{ background: 'rgba(255,255,255,0.05)', borderRadius: '12px', padding: '12px', textAlign: 'center' }}>
+                <p style={{ fontSize: '18px', fontWeight: 700, color }}>{value}</p>
+                <p style={{ fontSize: '11px', color: 'rgba(255,255,255,0.4)', marginTop: '4px' }}>{label}</p>
               </div>
             ))}
           </div>
 
+          {/* Cooldown timer */}
+          {onCooldown && expiresAt && <CooldownTimer expiresAt={expiresAt} />}
+
           {/* Vote buttons */}
-          <div className="space-y-2">
-            <p className="text-white/40 text-xs text-center">
-              {onCooldown
-                ? voted
-                  ? `You voted ${voted === 'positive' ? '👍 Positive' : '👎 Negative'} · Cooldown 24h`
-                  : 'Already voted today'
-                : 'Cast your vote (once per 24h)'}
-            </p>
-            <div className="grid grid-cols-2 gap-3">
-              <button
-                onClick={() => handleVote('positive')}
-                disabled={onCooldown || loading}
-                className={`
-                  py-3 rounded-xl font-bold text-sm transition-all duration-200
-                  flex items-center justify-center gap-2
-                  ${voted === 'positive'
-                    ? 'bg-green-500 text-white ring-2 ring-green-400/50'
-                    : onCooldown
-                    ? 'bg-white/5 text-white/20 cursor-not-allowed'
-                    : 'bg-green-500/20 text-green-400 hover:bg-green-500/40 active:scale-95'}
-                `}
-              >
-                <span className="text-lg">👍</span>
-                Positive
-              </button>
-              <button
-                onClick={() => handleVote('negative')}
-                disabled={onCooldown || loading}
-                className={`
-                  py-3 rounded-xl font-bold text-sm transition-all duration-200
-                  flex items-center justify-center gap-2
-                  ${voted === 'negative'
-                    ? 'bg-red-500 text-white ring-2 ring-red-400/50'
-                    : onCooldown
-                    ? 'bg-white/5 text-white/20 cursor-not-allowed'
-                    : 'bg-red-500/20 text-red-400 hover:bg-red-500/40 active:scale-95'}
-                `}
-              >
-                <span className="text-lg">👎</span>
-                Negative
-              </button>
+          <div>
+            {!onCooldown && (
+              <p style={{ color: 'rgba(255,255,255,0.35)', fontSize: '11px', textAlign: 'center', marginBottom: '8px' }}>
+                {checkingCooldown ? 'Checking…' : 'Cast your vote · once per cooldown period'}
+              </p>
+            )}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
+              {(['positive', 'negative'] as const).map(type => {
+                const isThis = voted === type
+                const isPos = type === 'positive'
+                const activeColor = isPos ? '#22c55e' : '#ef4444'
+                const activeBg = isPos ? 'rgba(34,197,94,0.2)' : 'rgba(239,68,68,0.2)'
+                const hoverBg = isPos ? 'rgba(34,197,94,0.35)' : 'rgba(239,68,68,0.35)'
+
+                return (
+                  <button
+                    key={type}
+                    onClick={() => handleVote(type)}
+                    disabled={onCooldown || loading || checkingCooldown}
+                    style={{
+                      padding: '12px',
+                      borderRadius: '12px',
+                      border: isThis ? `2px solid ${activeColor}` : '2px solid transparent',
+                      background: isThis ? activeBg : onCooldown ? 'rgba(255,255,255,0.04)' : activeBg,
+                      color: isThis ? activeColor : onCooldown ? 'rgba(255,255,255,0.2)' : activeColor,
+                      cursor: onCooldown || loading ? 'not-allowed' : 'pointer',
+                      fontWeight: 700,
+                      fontSize: '14px',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      gap: '6px',
+                      transition: 'all 0.15s',
+                      opacity: onCooldown && !isThis ? 0.4 : 1,
+                    }}
+                    onMouseEnter={e => {
+                      if (!onCooldown && !loading) (e.currentTarget as HTMLButtonElement).style.background = hoverBg
+                    }}
+                    onMouseLeave={e => {
+                      (e.currentTarget as HTMLButtonElement).style.background = isThis ? activeBg : onCooldown ? 'rgba(255,255,255,0.04)' : activeBg
+                    }}
+                  >
+                    <span style={{ fontSize: '18px' }}>{isPos ? '👍' : '👎'}</span>
+                    {isPos ? 'Positive' : 'Negative'}
+                  </button>
+                )
+              })}
             </div>
           </div>
 
           {/* Share */}
           <button
             onClick={handleShare}
-            className="w-full py-2.5 rounded-xl bg-white/5 text-white/60 hover:bg-white/10 hover:text-white transition-all text-sm font-medium flex items-center justify-center gap-2"
+            style={{
+              width: '100%', padding: '10px', borderRadius: '12px',
+              background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.08)',
+              color: 'rgba(255,255,255,0.5)', cursor: 'pointer', fontSize: '13px',
+              fontWeight: 500, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px',
+            }}
           >
-            <span>↗</span> Share sentiment card
+            ↗ Share sentiment card
           </button>
         </div>
       </div>
