@@ -38,7 +38,7 @@ export default function ActivityFeed() {
             .from('countries')
             .select('name, iso_code, flag_emoji')
             .eq('id', vote.country_id)
-            .single()
+ 	    .single() as any
 
           if (!country) return
 
