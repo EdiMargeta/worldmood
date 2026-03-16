@@ -95,7 +95,7 @@ const WorldMap = memo(({ countries, onCountryClick }: WorldMapProps) => {
           maxZoom={6}
         >
           <Geographies geography={GEO_URL}>
-            {({ geographies }) =>
+	{({ geographies }: { geographies: any[] }) =>
               geographies.map((geo) => {
                 const numericId = geo.id?.toString().padStart(3, '0')
                 const isoCode = ISO_NUMERIC_TO_ALPHA2[numericId || ''] || ''
